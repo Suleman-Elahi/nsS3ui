@@ -68,7 +68,8 @@ class TransferManager(QObject):
     def __init__(self, client: S3Client, parent=None):
         super().__init__(parent)
         self._client = client
-        self._pool = QThreadPool.globalInstance()
+        # Dedicated pool keeps heavy transfers from starving UI/listing workers.
+        self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(MAX_UPLOAD_WORKERS + MAX_DOWNLOAD_WORKERS + 4)
         self._transfers: dict[str, TransferItem] = {}
         self._pending_pause: set[str] = set()

@@ -68,10 +68,10 @@ class TransferTableModel(QAbstractTableModel):
         return None
 
     def add_transfer(self, item: TransferItem) -> None:
-        row = len(self._items)
+        row = 0
         self.beginInsertRows(QModelIndex(), row, row)
-        self._items.append(item)
-        self._id_to_row[item.id] = row
+        self._items.insert(0, item)
+        self._id_to_row = {it.id: idx for idx, it in enumerate(self._items)}
         self.endInsertRows()
 
     def update_transfer(self, transfer_id: str) -> None:

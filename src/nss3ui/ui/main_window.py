@@ -20,7 +20,7 @@ from nss3ui.ui.transfer_panel import TransferPanel
 from nss3ui.ui.connect_dialog import ConnectDialog
 from nss3ui.ui.settings_dialog import SettingsDialog
 from nss3ui.ui.icons import (
-    icon_upload, icon_download, icon_refresh, icon_account
+    icon_upload, icon_folder, icon_refresh, icon_account
 )
 from nss3ui.s3client import S3Client
 from nss3ui.transfer_manager import TransferManager, TransferDirection, TransferStatus
@@ -117,17 +117,16 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
-        self._upload_action = QAction(icon_upload(), "Upload", self)
+        self._upload_action = QAction(icon_upload(), "Upload File(s)", self)
         self._upload_action.setShortcut(QKeySequence("Ctrl+U"))
         self._upload_action.triggered.connect(self._object_browser._upload_files)
         self._upload_action.setEnabled(False)
         tb.addAction(self._upload_action)
 
-        self._download_action = QAction(icon_download(), "Download", self)
-        self._download_action.setShortcut(QKeySequence("Ctrl+D"))
-        self._download_action.triggered.connect(self._object_browser._download_selected)
-        self._download_action.setEnabled(False)
-        tb.addAction(self._download_action)
+        self._upload_folder_action = QAction(icon_folder(), "Upload Folder", self)
+        self._upload_folder_action.triggered.connect(self._object_browser._upload_folder)
+        self._upload_folder_action.setEnabled(False)
+        tb.addAction(self._upload_folder_action)
 
         tb.addSeparator()
 
@@ -211,7 +210,7 @@ class MainWindow(QMainWindow):
             self._setup_transfer_panel()
 
             self._upload_action.setEnabled(True)
-            self._download_action.setEnabled(True)
+            self._upload_folder_action.setEnabled(True)
             self._refresh_action.setEnabled(True)
 
             self._set_status("Connected")
@@ -231,7 +230,7 @@ class MainWindow(QMainWindow):
         self._manager = None
         self._profile_label.setText("Not connected")
         self._upload_action.setEnabled(False)
-        self._download_action.setEnabled(False)
+        self._upload_folder_action.setEnabled(False)
         self._refresh_action.setEnabled(False)
         self._set_status("Connection failed")
         QMessageBox.critical(self, title, message)

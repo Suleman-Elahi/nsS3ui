@@ -5,16 +5,17 @@ All S3 calls happen in worker threads — UI thread never blocks.
 from __future__ import annotations
 import os
 import logging
+from collections import deque
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableView, QLabel,
     QPushButton, QLineEdit, QMenu, QMessageBox, QFileDialog,
     QAbstractItemView, QToolButton, QApplication, QScrollBar
 )
-from PySide6.QtCore import Qt, Signal, QThreadPool
+from PySide6.QtCore import Qt, Signal, QThreadPool, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut
 from nss3ui.ui.object_model import ObjectTableModel, make_proxy, S3ObjectItem
 from nss3ui.ui.icons import (
-    icon_upload, icon_download, icon_delete, icon_refresh, icon_copy_link
+    icon_upload, icon_download, icon_folder, icon_delete, icon_refresh, icon_copy_link
 )
 from nss3ui.workers.async_list_worker import AsyncListObjectsWorker
 from nss3ui.workers.transfer_worker import DeleteWorker
@@ -42,6 +43,9 @@ class ObjectBrowser(QWidget):
         self._prefix: str = ""
         self._next_token: str = ""
         self._loading = False
+        self._pending_uploads: deque[tuple[str, str, str]] = deque()
+        self._pending_download_files: deque[tuple[str, str, str, int]] = deque()
+        self._pending_download_folders: deque[tuple[str, str, str]] = deque()
         self._setup_ui()
         self._setup_shortcuts()
 
@@ -79,8 +83,8 @@ class ObjectBrowser(QWidget):
         self._search.textChanged.connect(self._on_filter)
 
         for icon_fn, tip, slot, attr in [
-            (icon_upload,   "Upload files (Ctrl+U)",      self._upload_files,    "_upload_btn"),
-            (icon_download, "Download selected (Ctrl+D)", self._download_selected, "_download_btn"),
+            (icon_upload,   "Upload File(s) (Ctrl+U)",    self._upload_files,    "_upload_btn"),
+            (icon_folder,   "Upload Folder",              self._upload_folder,   "_upload_folder_btn"),
             (icon_delete,   "Delete selected (Del)",      self._delete_selected, "_delete_btn"),
             (icon_refresh,  "Refresh (F5)",               self._refresh,         "_refresh_btn"),
         ]:
@@ -95,7 +99,7 @@ class ObjectBrowser(QWidget):
         tb.addWidget(self._breadcrumb, 1)
         tb.addWidget(self._search)
         tb.addWidget(self._upload_btn)
-        tb.addWidget(self._download_btn)
+        tb.addWidget(self._upload_folder_btn)
         tb.addWidget(self._delete_btn)
         tb.addWidget(self._refresh_btn)
 
@@ -200,7 +204,14 @@ class ObjectBrowser(QWidget):
 
     def _on_load_error(self, msg: str) -> None:
         self._loading = False
-        self.status_message.emit(f"Error: {short_error(msg)}")
+        pretty = short_error(msg)
+        low = (msg or "").lower()
+        if "accessdenied" in low and "listbucket" in low and self._bucket:
+            pretty += (
+                f" Ask your AWS admin to allow `s3:ListBucket` on "
+                f"`arn:aws:s3:::{self._bucket}`."
+            )
+        self.status_message.emit(f"Error: {pretty}")
         log.error("ObjectBrowser load error: %s", msg)
 
     def _load_next_page(self) -> None:
@@ -267,7 +278,42 @@ class ObjectBrowser(QWidget):
         paths, _ = QFileDialog.getOpenFileNames(self, "Select files to upload")
         for path in paths:
             key = self._prefix + os.path.basename(path)
-            self.upload_requested.emit(path, self._bucket, key)
+            self._pending_uploads.append((path, self._bucket, key))
+        if self._pending_uploads:
+            self.status_message.emit(f"Queueing {len(self._pending_uploads)} upload(s)…")
+            QTimer.singleShot(0, self._drain_upload_queue)
+
+    def _upload_folder(self) -> None:
+        if not self._bucket:
+            return
+        folder = QFileDialog.getExistingDirectory(self, "Select folder to upload")
+        if not folder:
+            return
+
+        root_name = os.path.basename(folder.rstrip("/\\"))
+        key_root = self._prefix + root_name + "/"
+        queued = 0
+        for dirpath, _dirnames, filenames in os.walk(folder):
+            for filename in filenames:
+                local_path = os.path.join(dirpath, filename)
+                rel_path = os.path.relpath(local_path, folder).replace("\\", "/")
+                key = key_root + rel_path
+                self._pending_uploads.append((local_path, self._bucket, key))
+                queued += 1
+        self.status_message.emit(f"Queueing {queued} file(s) from folder: {root_name}…")
+        if queued > 0:
+            QTimer.singleShot(0, self._drain_upload_queue)
+
+    def _drain_upload_queue(self) -> None:
+        """Emit uploads in chunks so large selections do not block the UI."""
+        chunk_size = 25
+        sent = 0
+        while sent < chunk_size and self._pending_uploads:
+            local_path, bucket, key = self._pending_uploads.popleft()
+            self.upload_requested.emit(local_path, bucket, key)
+            sent += 1
+        if self._pending_uploads:
+            QTimer.singleShot(0, self._drain_upload_queue)
 
     def _download_selected(self) -> None:
         """Download selected files; if a folder is selected, offer ZIP download."""
@@ -283,16 +329,40 @@ class ObjectBrowser(QWidget):
         if not dest:
             return
 
-        # Download individual files
+        # Queue individual file downloads
         for item in files:
             local_path = os.path.join(dest, item.display_name)
-            self.download_requested.emit(self._bucket, item.key, local_path, item.size)
+            self._pending_download_files.append((self._bucket, item.key, local_path, item.size))
 
-        # Download folders as ZIP
+        # Queue folder ZIP downloads
         for folder in folders:
             folder_name = folder.key.rstrip("/").rsplit("/", 1)[-1]
             zip_path = os.path.join(dest, f"{folder_name}.zip")
-            self.folder_download_requested.emit(self._bucket, folder.key, zip_path)
+            self._pending_download_folders.append((self._bucket, folder.key, zip_path))
+
+        total = len(self._pending_download_files) + len(self._pending_download_folders)
+        if total > 0:
+            self.status_message.emit(f"Queueing {total} download(s)…")
+            QTimer.singleShot(0, self._drain_download_queue)
+
+    def _drain_download_queue(self) -> None:
+        """
+        Emit downloads in chunks so large mixed selections do not block
+        the Qt main event loop.
+        """
+        chunk_size = 25
+        sent = 0
+        while sent < chunk_size and self._pending_download_files:
+            bucket, key, local_path, size = self._pending_download_files.popleft()
+            self.download_requested.emit(bucket, key, local_path, size)
+            sent += 1
+        while sent < chunk_size and self._pending_download_folders:
+            bucket, prefix, zip_path = self._pending_download_folders.popleft()
+            self.folder_download_requested.emit(bucket, prefix, zip_path)
+            sent += 1
+
+        if self._pending_download_files or self._pending_download_folders:
+            QTimer.singleShot(0, self._drain_download_queue)
 
     def _delete_selected(self) -> None:
         items = self._get_selected_file_items()

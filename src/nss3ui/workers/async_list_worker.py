@@ -9,10 +9,23 @@ from typing import Optional
 from PySide6.QtCore import QRunnable, QObject, Signal
 import aioboto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 log = logging.getLogger(__name__)
 
 PAGE_SIZE = 1000
+
+
+def _format_aws_error(exc: ClientError) -> str:
+    err = exc.response.get("Error", {}) if isinstance(exc.response, dict) else {}
+    code = (err.get("Code") or "").strip()
+    msg = (err.get("Message") or str(exc)).strip()
+    op = getattr(exc, "operation_name", "").strip()
+    if code and op:
+        return f"{code} ({op}): {msg}"
+    if code:
+        return f"{code}: {msg}"
+    return msg or str(exc)
 
 
 class AsyncListSignals(QObject):
@@ -54,6 +67,11 @@ class AsyncListObjectsWorker(QRunnable):
     def run(self) -> None:
         try:
             asyncio.run(self._async_run())
+        except ClientError as exc:
+            # Permission or policy errors are expected in some environments.
+            msg = _format_aws_error(exc)
+            log.warning("AsyncListObjectsWorker AWS error: %s", msg)
+            self._emit_safe(self.signals.error, msg)
         except Exception as exc:
             log.exception("AsyncListObjectsWorker failed")
             self._emit_safe(self.signals.error, str(exc))
@@ -98,6 +116,10 @@ class AsyncListBucketsWorker(QRunnable):
     def run(self) -> None:
         try:
             asyncio.run(self._async_run())
+        except ClientError as exc:
+            msg = _format_aws_error(exc)
+            log.warning("AsyncListBucketsWorker AWS error: %s", msg)
+            self._emit_safe(self.signals.error, msg)
         except Exception as exc:
             log.exception("AsyncListBucketsWorker failed")
             self._emit_safe(self.signals.error, str(exc))

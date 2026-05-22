@@ -172,13 +172,14 @@ class S3Client:
     ) -> None:
         from boto3.s3.transfer import TransferConfig
         tune = get_transfer_tuning()
+        max_concurrency = max(1, int(tune["max_concurrency"]))
         # High-throughput multipart transfer tuned for large file workloads.
         # Progress callback is thread-safe on worker side.
         config = TransferConfig(
             multipart_threshold=int(tune["multipart_threshold_mb"]) * 1024 * 1024,
             multipart_chunksize=int(tune["multipart_chunksize_mb"]) * 1024 * 1024,
-            max_concurrency=1,
-            use_threads=False,
+            max_concurrency=max_concurrency,
+            use_threads=max_concurrency > 1,
         )
         self._client.upload_file(
             local_path,
@@ -198,11 +199,12 @@ class S3Client:
     ) -> None:
         from boto3.s3.transfer import TransferConfig
         tune = get_transfer_tuning()
+        max_concurrency = max(1, int(tune["max_concurrency"]))
         config = TransferConfig(
             multipart_threshold=int(tune["multipart_threshold_mb"]) * 1024 * 1024,
             multipart_chunksize=int(tune["multipart_chunksize_mb"]) * 1024 * 1024,
-            max_concurrency=1,
-            use_threads=False,
+            max_concurrency=max_concurrency,
+            use_threads=max_concurrency > 1,
         )
         self._client.download_file(
             bucket,
