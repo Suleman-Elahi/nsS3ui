@@ -7,7 +7,7 @@ import logging
 from botocore.exceptions import ProfileNotFound
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QVBoxLayout,
-    QStatusBar, QToolBar, QLabel, QSizePolicy, QMessageBox, QFileDialog
+    QStatusBar, QToolBar, QLabel, QSizePolicy, QMessageBox, QFileDialog, QProgressBar
 )
 from PySide6.QtCore import Qt, QSize, QThreadPool
 from PySide6.QtGui import QAction, QKeySequence
@@ -44,6 +44,9 @@ class MainWindow(QMainWindow):
         self._controller = AppController(self)
         self._state = AppStateManager(self)
         self._current_theme = get_theme()
+        self._overall_total = 0
+        self._overall_done = 0
+        self._overall_active: set[str] = set()
 
         self._apply_theme(self._current_theme)
         self._setup_ui()
@@ -154,6 +157,14 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self._statusbar)
         self._status_label = QLabel("Ready")
         self._statusbar.addWidget(self._status_label)
+        self._overall_progress = QProgressBar(self)
+        self._overall_progress.setRange(0, 100)
+        self._overall_progress.setValue(0)
+        self._overall_progress.setFixedWidth(160)
+        self._overall_progress.setFixedHeight(12)
+        self._overall_progress.setTextVisible(False)
+        self._overall_progress.setVisible(False)
+        self._statusbar.addPermanentWidget(self._overall_progress)
 
     def _connect_signals(self) -> None:
         self._bucket_panel.bucket_selected.connect(self._on_bucket_selected)
@@ -241,6 +252,9 @@ class MainWindow(QMainWindow):
             return
         self._transfer_placeholder.setParent(None)
         self._transfer_panel = TransferPanel(self._manager)
+        self._manager.transfer_added.connect(self._on_transfer_added_progress)
+        self._manager.transfer_cancelled.connect(self._on_transfer_terminal_progress)
+        self._manager.transfer_failed.connect(lambda tid, _err: self._on_transfer_terminal_progress(tid))
         self._manager.transfer_finished.connect(self._on_transfer_finished)
         self._transfer_panel.setMaximumHeight(200)
         self._transfer_panel.setMinimumHeight(120)
@@ -298,6 +312,7 @@ class MainWindow(QMainWindow):
     def _on_transfer_finished(self, transfer_id: str) -> None:
         if not self._manager:
             return
+        self._on_transfer_terminal_progress(transfer_id)
         item = self._manager.get_item(transfer_id)
         if not item or item.direction != TransferDirection.UPLOAD or item.status != TransferStatus.COMPLETED:
             return
@@ -311,3 +326,31 @@ class MainWindow(QMainWindow):
 
     def _set_status(self, msg: str) -> None:
         self._status_label.setText(msg)
+
+    def _on_transfer_added_progress(self, transfer_id: str) -> None:
+        if not self._manager:
+            return
+        if not self._overall_active and self._overall_done >= self._overall_total:
+            self._overall_total = 0
+            self._overall_done = 0
+        self._overall_active.add(transfer_id)
+        self._overall_total += 1
+        self._update_overall_progress()
+
+    def _on_transfer_terminal_progress(self, transfer_id: str) -> None:
+        if transfer_id in self._overall_active:
+            self._overall_active.discard(transfer_id)
+            self._overall_done += 1
+        self._update_overall_progress()
+        if not self._overall_active:
+            # Reset after batch completion.
+            self._overall_progress.setVisible(False)
+            self._overall_progress.setValue(0)
+            self._overall_total = 0
+            self._overall_done = 0
+
+    def _update_overall_progress(self) -> None:
+        total = max(1, self._overall_total)
+        pct = int((self._overall_done / total) * 100)
+        self._overall_progress.setVisible(bool(self._overall_active))
+        self._overall_progress.setValue(max(0, min(100, pct)))

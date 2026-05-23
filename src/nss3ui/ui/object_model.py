@@ -107,9 +107,11 @@ class ObjectTableModel(QAbstractTableModel):
     def append_page(self, objects: list[dict], prefixes: list[str]) -> None:
         """Append a page of results without full reset."""
         new_items: list[S3ObjectItem] = []
+        folder_keys: set[str] = set()
 
         for prefix in prefixes:
             display = prefix.rstrip("/").rsplit("/", 1)[-1] + "/"
+            folder_keys.add(prefix)
             new_items.append(S3ObjectItem(
                 key=prefix,
                 display_name=display,
@@ -118,6 +120,19 @@ class ObjectTableModel(QAbstractTableModel):
 
         for obj in objects:
             key: str = obj["Key"]
+            # S3 folder markers are real zero-byte objects like "path/to/folder/".
+            # Render them as folders and avoid duplicate rows when CommonPrefixes already has them.
+            if key.endswith("/") and int(obj.get("Size", 0)) == 0:
+                if key in folder_keys:
+                    continue
+                folder_keys.add(key)
+                display = key.rstrip("/").rsplit("/", 1)[-1] + "/"
+                new_items.append(S3ObjectItem(
+                    key=key,
+                    display_name=display,
+                    is_folder=True,
+                ))
+                continue
             display = key.rsplit("/", 1)[-1] if "/" in key else key
             new_items.append(S3ObjectItem(
                 key=key,

@@ -8,8 +8,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QDesktopServices
 from PySide6.QtCore import QUrl
-from nss3ui.ui.transfer_model import TransferTableModel, COL_PROGRESS
-from nss3ui.ui.delegates import ProgressBarDelegate
+from nss3ui.ui.transfer_model import TransferTableModel, COL_PROGRESS, COL_ACTIONS
+from nss3ui.ui.delegates import ProgressBarDelegate, ActionButtonsDelegate
 from nss3ui.transfer_manager import TransferManager, TransferStatus, TransferDirection
 
 
@@ -58,6 +58,9 @@ class TransferPanel(QWidget):
         self._table.verticalHeader().setVisible(False)
         self._table.setAlternatingRowColors(True)
         self._table.setItemDelegateForColumn(COL_PROGRESS, ProgressBarDelegate(self._table))
+        self._actions_delegate = ActionButtonsDelegate(self._table)
+        self._actions_delegate.action_requested.connect(self._on_action_requested)
+        self._table.setItemDelegateForColumn(COL_ACTIONS, self._actions_delegate)
         self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._context_menu)
 
@@ -81,17 +84,14 @@ class TransferPanel(QWidget):
         self._manager.transfer_cancelled.connect(self._on_transfer_updated)
         for item in self._manager.all_items():
             self._model.add_transfer(item)
-            self._refresh_row_actions(item.id)
 
     def _on_transfer_added(self, tid: str) -> None:
         item = self._manager.get_item(tid)
         if item:
             self._model.add_transfer(item)
-            self._refresh_row_actions(tid)
 
     def _on_transfer_updated(self, tid: str) -> None:
         self._model.update_transfer(tid)
-        self._refresh_row_actions(tid)
 
     def _clear_completed(self) -> None:
         self._manager.clear_terminal()
@@ -125,38 +125,19 @@ class TransferPanel(QWidget):
             retry.triggered.connect(lambda: self._manager.retry(item.id))
         menu.exec(self._table.viewport().mapToGlobal(pos))
 
-    def _refresh_row_actions(self, tid: str) -> None:
-        row = self._model._id_to_row.get(tid)
-        if row is None:
-            return
-        item = self._model._items[row]
-        cell = QWidget(self._table)
-        layout = QHBoxLayout(cell)
-        layout.setContentsMargins(4, 2, 4, 2)
-        layout.setSpacing(4)
-        if item.status == TransferStatus.RUNNING:
-            b1 = QPushButton("Pause")
-            b1.clicked.connect(lambda _=False, tid=item.id: self._manager.pause(tid))
-            b2 = QPushButton("Cancel")
-            b2.clicked.connect(lambda _=False, tid=item.id: self._manager.cancel(tid))
-            layout.addWidget(b1)
-            layout.addWidget(b2)
-        elif item.status == TransferStatus.PAUSED:
-            b1 = QPushButton("Resume")
-            b1.clicked.connect(lambda _=False, tid=item.id: self._manager.resume(tid))
-            b2 = QPushButton("Cancel")
-            b2.clicked.connect(lambda _=False, tid=item.id: self._manager.cancel(tid))
-            layout.addWidget(b1)
-            layout.addWidget(b2)
-        elif item.status in (TransferStatus.FAILED, TransferStatus.CANCELLED):
-            b1 = QPushButton("Retry")
-            b1.clicked.connect(lambda _=False, tid=item.id: self._manager.retry(tid))
-            layout.addWidget(b1)
-        elif item.status == TransferStatus.COMPLETED and item.direction == TransferDirection.DOWNLOAD:
-            b1 = QPushButton("Show Folder")
-            b1.clicked.connect(lambda _=False, p=item.local_path: self._open_containing_folder(p))
-            layout.addWidget(b1)
-        self._table.setIndexWidget(self._model.index(row, 6), cell)
+    def _on_action_requested(self, action: str, transfer_id: str) -> None:
+        if action == "Pause":
+            self._manager.pause(transfer_id)
+        elif action == "Cancel":
+            self._manager.cancel(transfer_id)
+        elif action == "Resume":
+            self._manager.resume(transfer_id)
+        elif action == "Retry":
+            self._manager.retry(transfer_id)
+        elif action == "Show Folder":
+            item = self._manager.get_item(transfer_id)
+            if item:
+                self._open_containing_folder(item.local_path)
 
     def _open_containing_folder(self, path: str) -> None:
         folder = os.path.dirname(path) or path

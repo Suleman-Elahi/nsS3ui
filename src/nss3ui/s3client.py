@@ -158,6 +158,17 @@ class S3Client:
             ExpiresIn=expires,
         )
 
+    def put_object_tagging(self, bucket: str, key: str, tags: dict[str, str]) -> None:
+        tag_set = [{"Key": k, "Value": v} for k, v in tags.items()]
+        self._client.put_object_tagging(
+            Bucket=bucket,
+            Key=key,
+            Tagging={"TagSet": tag_set},
+        )
+
+    def put_object_acl(self, bucket: str, key: str, acl: str) -> None:
+        self._client.put_object_acl(Bucket=bucket, Key=key, ACL=acl)
+
     # ------------------------------------------------------------------
     # Upload / Download (streaming)
     # ------------------------------------------------------------------

@@ -53,6 +53,12 @@ def icon_account() -> QIcon:
     return _make_text_icon("👤", "#c586c0")
 
 
+def icon_tag() -> QIcon:
+    return _make_text_icon("TG", "#e5c07b")
+
+
+def icon_lock() -> QIcon:
+    return _make_text_icon("ACL", "#d19a66", size=22)
 def _make_text_icon(text: str, color: str = "#d4d4d4", size: int = 20) -> QIcon:
     px = QPixmap(size, size)
     px.fill(Qt.GlobalColor.transparent)
@@ -76,3 +82,4 @@ def file_icon(key: str) -> QIcon:
     if ext in text_exts:
         return icon_file()
     return icon_file()
+

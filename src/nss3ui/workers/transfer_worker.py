@@ -12,6 +12,7 @@ import os
 import time
 import threading
 import logging
+import mimetypes
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PySide6.QtCore import QRunnable
 from nss3ui.workers.signals import WorkerSignals
@@ -99,6 +100,7 @@ class UploadWorker(QRunnable):
             self._emit("error", str(exc))
 
     def _upload_resumable_multipart(self) -> None:
+        extra_args = self._build_upload_extra_args()
         # Fast path for normal transfers: boto3 managed transfer is fastest.
         # Use custom resumable multipart only when we already have resume state.
         if not self._resume_state or not self._resume_state.get("upload_id"):
@@ -107,6 +109,7 @@ class UploadWorker(QRunnable):
                 self._bucket,
                 self._key,
                 progress_callback=self._progress,
+                extra_args=extra_args,
             )
             return
         tune = get_transfer_tuning()
@@ -160,6 +163,18 @@ class UploadWorker(QRunnable):
             raise InterruptedError("Upload cancelled")
         self._client.complete_multipart_upload(self._bucket, self._key, upload_id, parts)
         self._emit("checkpoint", {})
+
+    def _build_upload_extra_args(self) -> dict:
+        """
+        Attach best-effort content metadata so browsers/openers handle files correctly.
+        """
+        content_type, content_encoding = mimetypes.guess_type(self._local_path)
+        args = {
+            "ContentType": content_type or "application/octet-stream",
+        }
+        if content_encoding:
+            args["ContentEncoding"] = content_encoding
+        return args
 
 
 class DownloadWorker(QRunnable):
@@ -292,7 +307,11 @@ class DeleteWorker(QRunnable):
 
     def run(self) -> None:
         try:
-            failed = self._client.delete_objects(self._bucket, self._keys)
+            failed: list[str] = []
+            chunk_size = 1000  # S3 DeleteObjects API limit
+            for i in range(0, len(self._keys), chunk_size):
+                chunk = self._keys[i:i + chunk_size]
+                failed.extend(self._client.delete_objects(self._bucket, chunk))
             self.signals.finished.emit(failed)
         except Exception as exc:
             log.exception("DeleteWorker failed")

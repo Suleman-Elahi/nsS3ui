@@ -8,20 +8,23 @@ import logging
 from collections import deque
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableView, QLabel,
-    QPushButton, QLineEdit, QMenu, QMessageBox, QFileDialog,
+    QPushButton, QLineEdit, QMenu, QMessageBox, QFileDialog, QInputDialog,
     QAbstractItemView, QToolButton, QApplication, QScrollBar
 )
-from PySide6.QtCore import Qt, Signal, QThreadPool, QTimer
+from PySide6.QtCore import Qt, Signal, QThreadPool, QTimer, QEvent
 from PySide6.QtGui import QKeySequence, QShortcut
 from nss3ui.ui.object_model import ObjectTableModel, make_proxy, S3ObjectItem
 from nss3ui.ui.icons import (
-    icon_upload, icon_download, icon_folder, icon_delete, icon_refresh, icon_copy_link
+    icon_upload, icon_download, icon_folder, icon_delete, icon_refresh, icon_copy_link, icon_new_folder,
+    icon_tag, icon_lock
 )
 from nss3ui.workers.async_list_worker import AsyncListObjectsWorker
 from nss3ui.workers.transfer_worker import DeleteWorker
-from nss3ui.workers.folder_worker import FolderDownloadWorker
+from nss3ui.workers.prefix_move_worker import PrefixMoveWorker
+from nss3ui.workers.local_drop_scan_worker import LocalDropScanWorker
 from nss3ui.s3client import S3Client
 from nss3ui.ui.error_text import short_error
+from nss3ui.ui.object_ops import prompt_for_tags, prompt_for_acl, prompt_for_destination_prefix
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +47,7 @@ class ObjectBrowser(QWidget):
         self._next_token: str = ""
         self._loading = False
         self._pending_uploads: deque[tuple[str, str, str]] = deque()
+        self._pending_drop_tasks: deque[tuple[str, str]] = deque()
         self._pending_download_files: deque[tuple[str, str, str, int]] = deque()
         self._pending_download_folders: deque[tuple[str, str, str]] = deque()
         self._setup_ui()
@@ -121,6 +125,9 @@ class ObjectBrowser(QWidget):
         self._table.doubleClicked.connect(self._on_double_click)
         self._table.selectionModel().selectionChanged.connect(self._on_selection_changed)
         self._table.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        self._table.setAcceptDrops(True)
+        self._table.viewport().setAcceptDrops(True)
+        self._table.viewport().installEventFilter(self)
 
         hdr = self._table.horizontalHeader()
         hdr.resizeSection(0, 320)
@@ -190,6 +197,9 @@ class ObjectBrowser(QWidget):
         QThreadPool.globalInstance().start(worker)
 
     def _on_page_ready(self, objects: list, prefixes: list) -> None:
+        if self._prefix:
+            # Hide the current folder marker object (e.g., "path/current/") from its own listing.
+            objects = [o for o in objects if o.get("Key") != self._prefix]
         self._model.append_page(objects, prefixes)
         count = self._model.rowCount()
         self.status_message.emit(f"{count} items in {self._bucket}/{self._prefix or '/'}")
@@ -268,6 +278,20 @@ class ObjectBrowser(QWidget):
     def _on_filter(self, text: str) -> None:
         self._proxy.setFilterFixedString(text)
 
+    def eventFilter(self, watched, event) -> bool:
+        if watched is self._table.viewport():
+            et = event.type()
+            if et in (QEvent.Type.DragEnter, QEvent.Type.DragMove):
+                if self._accept_drop_event(event):
+                    event.acceptProposedAction()
+                else:
+                    event.ignore()
+                return True
+            if et == QEvent.Type.Drop:
+                self._handle_drop_event(event)
+                return True
+        return super().eventFilter(watched, event)
+
     # ------------------------------------------------------------------
     # Actions
     # ------------------------------------------------------------------
@@ -314,6 +338,58 @@ class ObjectBrowser(QWidget):
             sent += 1
         if self._pending_uploads:
             QTimer.singleShot(0, self._drain_upload_queue)
+
+    def _accept_drop_event(self, event) -> bool:
+        if not self._bucket:
+            return False
+        md = event.mimeData()
+        return bool(md and md.hasUrls() and any(u.isLocalFile() for u in md.urls()))
+
+    def _handle_drop_event(self, event) -> None:
+        if not self._accept_drop_event(event):
+            event.ignore()
+            return
+        local_paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
+        local_paths = [p for p in local_paths if p]
+        if not local_paths:
+            event.ignore()
+            return
+        self.status_message.emit(f"Scanning dropped items ({len(local_paths)})…")
+        worker = LocalDropScanWorker(local_paths, self._prefix)
+        worker.signals.finished.connect(self._on_drop_scan_finished)
+        worker.signals.error.connect(
+            lambda err: QMessageBox.critical(self, "Drop Upload Error", short_error(err))
+        )
+        QThreadPool.globalInstance().start(worker)
+        event.acceptProposedAction()
+
+    def _on_drop_scan_finished(self, payload: object) -> None:
+        tasks = payload if isinstance(payload, list) else []
+        for task in tasks:
+            if not isinstance(task, (tuple, list)) or len(task) != 2:
+                continue
+            local_path, key = task
+            self._pending_drop_tasks.append((str(local_path), str(key)))
+        if self._pending_drop_tasks:
+            self.status_message.emit(f"Queueing {len(self._pending_drop_tasks)} dropped upload(s)…")
+            QTimer.singleShot(0, self._drain_drop_tasks)
+        else:
+            self.status_message.emit("No uploadable files found in drop.")
+
+    def _drain_drop_tasks(self) -> None:
+        """
+        Move scanned drop tasks into upload queue in chunks to keep UI responsive.
+        """
+        chunk_size = 200
+        moved = 0
+        while moved < chunk_size and self._pending_drop_tasks:
+            local_path, key = self._pending_drop_tasks.popleft()
+            self._pending_uploads.append((local_path, self._bucket, key))
+            moved += 1
+        if self._pending_uploads:
+            QTimer.singleShot(0, self._drain_upload_queue)
+        if self._pending_drop_tasks:
+            QTimer.singleShot(0, self._drain_drop_tasks)
 
     def _download_selected(self) -> None:
         """Download selected files; if a folder is selected, offer ZIP download."""
@@ -365,21 +441,38 @@ class ObjectBrowser(QWidget):
             QTimer.singleShot(0, self._drain_download_queue)
 
     def _delete_selected(self) -> None:
-        items = self._get_selected_file_items()
+        if not self._client or not self._bucket:
+            return
+        items = self._get_selected_items()
         if not items:
             return
+        file_items = [i for i in items if not i.is_folder]
+        folder_items = [i for i in items if i.is_folder]
         names = "\n".join(i.display_name for i in items[:5])
         if len(items) > 5:
             names += f"\n… and {len(items) - 5} more"
+        target_kind = "item(s)"
+        if folder_items and not file_items:
+            target_kind = "folder(s)"
+        elif file_items and not folder_items:
+            target_kind = "object(s)"
         reply = QMessageBox.question(
             self, "Delete Objects",
-            f"Delete {len(items)} object(s)?\n\n{names}",
+            f"Delete {len(items)} {target_kind}?\n\n{names}",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
-        keys = [i.key for i in items]
-        worker = DeleteWorker(self._client, self._bucket, keys)
+        keys: set[str] = {i.key for i in file_items}
+        for folder in folder_items:
+            keys.add(folder.key)
+            for obj in self._client.list_all_objects(self._bucket, folder.key):
+                key = obj.get("Key")
+                if key:
+                    keys.add(key)
+        if not keys:
+            return
+        worker = DeleteWorker(self._client, self._bucket, list(keys))
         worker.signals.finished.connect(self._on_delete_done)
         worker.signals.error.connect(
             lambda err: QMessageBox.critical(self, "Delete Error", short_error(err))
@@ -417,22 +510,43 @@ class ObjectBrowser(QWidget):
         src = self._proxy.mapToSource(index)
         item = self._model.item_at(src.row()) if index.isValid() else None
         menu = QMenu(self)
+        menu.setToolTipsVisible(True)
+        target_prefix = item.key if item and item.is_folder else self._prefix
 
         if item:
             if item.is_folder:
-                open_act = menu.addAction("📂  Open Folder")
+                open_act = menu.addAction(icon_folder(), "Open Folder")
                 open_act.triggered.connect(lambda: self.navigate(self._bucket, item.key))
+                new_folder_act = menu.addAction(icon_new_folder(), "New Folder Here...")
+                new_folder_act.triggered.connect(
+                    lambda _=False, p=target_prefix: self._create_folder_at(p)
+                )
                 dl_zip = menu.addAction(icon_download(), "Download as ZIP")
                 dl_zip.triggered.connect(lambda: self._download_folder_item(item))
+                move_folder_act = menu.addAction("Rename/Move Folder...")
+                move_folder_act.triggered.connect(lambda _=False, it=item: self._rename_move_folder(it))
             else:
+                new_folder_act = menu.addAction(icon_new_folder(), "New Folder Here...")
+                new_folder_act.triggered.connect(
+                    lambda _=False, p=target_prefix: self._create_folder_at(p)
+                )
                 dl_act = menu.addAction(icon_download(), "Download")
                 dl_act.triggered.connect(self._download_selected)
                 link_act = menu.addAction(icon_copy_link(), "Copy Presigned URL…")
                 link_act.triggered.connect(self._presign_selected)
+                menu.addSeparator()
+                tag_act = menu.addAction(icon_tag(), "Object Tags...")
+                tag_act.triggered.connect(lambda _=False, it=item: self._put_object_tagging(it))
+                acl_act = menu.addAction(icon_lock(), "Object ACL...")
+                acl_act.triggered.connect(lambda _=False, it=item: self._put_object_acl(it))
             menu.addSeparator()
             del_act = menu.addAction(icon_delete(), "Delete")
             del_act.triggered.connect(self._delete_selected)
         else:
+            new_folder_act = menu.addAction(icon_new_folder(), "New Folder Here...")
+            new_folder_act.triggered.connect(
+                lambda _=False, p=target_prefix: self._create_folder_at(p)
+            )
             up_act = menu.addAction(icon_upload(), "Upload Files Here")
             up_act.triggered.connect(self._upload_files)
 
@@ -449,6 +563,107 @@ class ObjectBrowser(QWidget):
         zip_path = os.path.join(dest, f"{folder_name}.zip")
         self.folder_download_requested.emit(self._bucket, item.key, zip_path)
 
+    def _create_folder_at(self, target_prefix: str) -> None:
+        if not self._client or not self._bucket:
+            return
+
+        name, ok = QInputDialog.getText(
+            self,
+            "Create Folder",
+            f"Folder name under s3://{self._bucket}/{target_prefix}",
+        )
+        if not ok:
+            return
+
+        rel = (name or "").strip().strip("/")
+        if not rel:
+            return
+
+        base = target_prefix if not target_prefix or target_prefix.endswith("/") else target_prefix + "/"
+        key = base + rel.rstrip("/") + "/"
+        try:
+            self._client.raw.put_object(Bucket=self._bucket, Key=key, Body=b"")
+            self.status_message.emit(f"Created folder: s3://{self._bucket}/{key}")
+            self._refresh()
+        except Exception as exc:
+            QMessageBox.critical(self, "Create Folder Error", short_error(str(exc)))
+
+    def _put_object_tagging(self, item: S3ObjectItem) -> None:
+        if not self._client or not self._bucket or item.is_folder:
+            return
+        tags = prompt_for_tags(self, self._bucket, item.key)
+        if tags is None:
+            return
+        try:
+            self._client.put_object_tagging(self._bucket, item.key, tags)
+            self.status_message.emit(f"Updated tags: {item.display_name}")
+        except Exception as exc:
+            QMessageBox.critical(self, "PutObjectTagging Error", short_error(str(exc)))
+
+    def _put_object_acl(self, item: S3ObjectItem) -> None:
+        if not self._client or not self._bucket or item.is_folder:
+            return
+        acl = prompt_for_acl(self, self._bucket, item.key)
+        if not acl:
+            return
+        try:
+            self._client.put_object_acl(self._bucket, item.key, acl)
+            self.status_message.emit(f"Updated ACL ({acl}): {item.display_name}")
+        except Exception as exc:
+            QMessageBox.critical(self, "PutObjectAcl Error", short_error(str(exc)))
+
+    def _rename_move_folder(self, item: S3ObjectItem) -> None:
+        if not self._client or not self._bucket or not item.is_folder:
+            return
+        src_prefix = item.key
+        dst_prefix_raw = prompt_for_destination_prefix(self, self._bucket, src_prefix)
+        if not dst_prefix_raw:
+            return
+        # If user enters just a folder name, keep it under the same parent prefix.
+        raw = dst_prefix_raw.strip().lstrip("/").rstrip("/")
+        if "/" not in raw:
+            parent = src_prefix.rstrip("/").rsplit("/", 1)[0]
+            dst_prefix = (parent + "/" if parent else "") + raw + "/"
+        else:
+            dst_prefix = raw + "/"
+        if dst_prefix == src_prefix:
+            return
+        if dst_prefix.startswith(src_prefix):
+            QMessageBox.warning(self, "Invalid Destination", "Destination cannot be inside the source folder.")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Rename/Move Folder",
+            f"Move s3://{self._bucket}/{src_prefix}\n-> s3://{self._bucket}/{dst_prefix}\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        worker = PrefixMoveWorker(self._client, self._bucket, src_prefix, dst_prefix)
+        worker.signals.started.connect(
+            lambda: self.status_message.emit(f"Moving folder: {src_prefix} -> {dst_prefix}")
+        )
+        worker.signals.progress.connect(
+            lambda done, total: self.status_message.emit(f"Moving folder objects: {done}/{total}")
+        )
+        worker.signals.finished.connect(self._on_move_folder_done)
+        worker.signals.error.connect(
+            lambda err: QMessageBox.critical(self, "Rename/Move Folder Error", short_error(err))
+        )
+        QThreadPool.globalInstance().start(worker)
+
+    def _on_move_folder_done(self, result: object) -> None:
+        data = result if isinstance(result, dict) else {}
+        moved = int(data.get("moved_count", 0))
+        failed = int(data.get("failed_delete_count", 0))
+        dst_prefix = str(data.get("dst_prefix", ""))
+        self.status_message.emit(f"Moved {moved} object(s) to {dst_prefix}")
+        if failed:
+            QMessageBox.warning(self, "Move Completed With Warnings", f"Failed to delete {failed} source object(s).")
+        self._refresh()
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -462,3 +677,7 @@ class ObjectBrowser(QWidget):
     def _get_selected_file_items(self) -> list[S3ObjectItem]:
         rows = self._selected_source_rows()
         return [i for i in self._model.selected_items(rows) if not i.is_folder]
+
+    def _get_selected_items(self) -> list[S3ObjectItem]:
+        rows = self._selected_source_rows()
+        return self._model.selected_items(rows)

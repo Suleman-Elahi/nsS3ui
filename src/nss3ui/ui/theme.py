@@ -31,6 +31,8 @@ QScrollBar { margin: 0; }
 QScrollBar:vertical  { width: 10px; }
 QScrollBar:horizontal { height: 10px; }
 QScrollBar::handle { border-radius: 5px; min-height: 20px; min-width: 20px; }
+QMenu::item { padding: 7px 20px 7px 26px; min-height: 18px; }
+QMenu::icon { padding-left: 8px; }
 
 /* Panel section headers (BUCKETS / TRANSFERS / PREVIEW) */
 QWidget#panelHeader {
@@ -186,9 +188,8 @@ QScrollBar::handle:hover { background: #686868; }
 /* Menus */
 QMenu {
     background-color: #2d2d2d; border: 1px solid #454545;
-    border-radius: 4px; padding: 4px 0; color: #d4d4d4;
+    border-radius: 4px; padding: 4px; color: #d4d4d4;
 }
-QMenu::item { padding: 6px 24px 6px 12px; }
 QMenu::item:selected { background-color: #094771; }
 QMenu::separator { height: 1px; background: #454545; margin: 4px 0; }
 
@@ -330,9 +331,8 @@ QScrollBar::handle:hover { background: #999999; }
 /* Menus */
 QMenu {
     background-color: #ffffff; border: 1px solid #cccccc;
-    border-radius: 4px; padding: 4px 0; color: #1e1e1e;
+    border-radius: 4px; padding: 4px; color: #1e1e1e;
 }
-QMenu::item { padding: 6px 24px 6px 12px; }
 QMenu::item:selected { background-color: #cce4f7; }
 QMenu::separator { height: 1px; background: #e0e0e0; margin: 4px 0; }
 
